@@ -1,0 +1,190 @@
+From 1020840a953111e720acaf01aec1ee156f9d3d13 Mon Sep 17 00:00:00 2001
+From: Andres <48775054+sunnysideness@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 08:33:31 -0800
+Subject: [PATCH 65/67] drm: sysfb: simpledrm: carry the panel refresh rate and
+ list its rates
+
+simpledrm builds its single mode with DRM_MODE_INIT(60, ...), so a compositor
+is told the display runs at 60 Hz even when the bootloader left a command-mode
+panel scanning faster. On the Titan 2 Elite the VTDR6130A scans at ~121 Hz;
+Mutter paced the whole desktop at 60 because that is what the mode said.
+
+Add drm_sysfb_mode_at() with an explicit rate (drm_sysfb_mode() keeps the 60 Hz
+default for every other sysfb user), and let simpledrm read an optional
+"refresh-rate" from the framebuffer node and log it.
+
+Also read an optional "refresh-rates" list and probe one extra mode per listed
+rate. A command-mode panel can switch its own rate, so the rates it supports
+belong in the mode list where the compositor can offer them.
+
+Signed-off-by: Andres <48775054+sunnysideness@users.noreply.github.com>
+---
+ drivers/gpu/drm/sysfb/drm_sysfb_helper.h  | 14 ++++++++
+ drivers/gpu/drm/sysfb/drm_sysfb_modeset.c | 35 ++++++++++++++++----
+ drivers/gpu/drm/sysfb/simpledrm.c         | 40 ++++++++++++++++++++++-
+ 3 files changed, 82 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/sysfb/drm_sysfb_helper.h b/drivers/gpu/drm/sysfb/drm_sysfb_helper.h
+index 547f2327a..9f2f5bbcf 100644
+--- a/drivers/gpu/drm/sysfb/drm_sysfb_helper.h
++++ b/drivers/gpu/drm/sysfb/drm_sysfb_helper.h
+@@ -62,6 +62,11 @@ struct drm_display_mode drm_sysfb_mode(unsigned int width,
+ 				       unsigned int height,
+ 				       unsigned int width_mm,
+ 				       unsigned int height_mm);
++struct drm_display_mode drm_sysfb_mode_at(unsigned int width,
++					  unsigned int height,
++					  unsigned int width_mm,
++					  unsigned int height_mm,
++					  unsigned int refresh);
+ 
+ /*
+  * Device
+@@ -74,6 +79,15 @@ struct drm_sysfb_device {
+ 
+ 	/* hardware settings */
+ 	struct drm_display_mode fb_mode;
++
++	/*
++	 * Extra modes for the same resolution at other refresh rates. A
++	 * command-mode panel left running by the bootloader can change its
++	 * rate, so expose the rates the panel supports.
++	 */
++	unsigned int n_extra_modes;
++	struct drm_display_mode *extra_modes;
++
+ 	const struct drm_format_info *fb_format;
+ 	unsigned int fb_pitch;
+ 	unsigned int fb_gamma_lut_size;
+diff --git a/drivers/gpu/drm/sysfb/drm_sysfb_modeset.c b/drivers/gpu/drm/sysfb/drm_sysfb_modeset.c
+index d2de29caf..e5bde4463 100644
+--- a/drivers/gpu/drm/sysfb/drm_sysfb_modeset.c
++++ b/drivers/gpu/drm/sysfb/drm_sysfb_modeset.c
+@@ -18,10 +18,11 @@
+ 
+ #include "drm_sysfb_helper.h"
+ 
+-struct drm_display_mode drm_sysfb_mode(unsigned int width,
+-				       unsigned int height,
+-				       unsigned int width_mm,
+-				       unsigned int height_mm)
++struct drm_display_mode drm_sysfb_mode_at(unsigned int width,
++					  unsigned int height,
++					  unsigned int width_mm,
++					  unsigned int height_mm,
++					  unsigned int refresh)
+ {
+ 	/*
+ 	 * Assume a monitor resolution of 96 dpi to
+@@ -34,12 +35,21 @@ struct drm_display_mode drm_sysfb_mode(unsigned int width,
+ 
+ 	{
+ 		const struct drm_display_mode mode = {
+-			DRM_MODE_INIT(60, width, height, width_mm, height_mm)
++			DRM_MODE_INIT(refresh, width, height, width_mm, height_mm)
+ 		};
+ 
+ 		return mode;
+ 	}
+ }
++EXPORT_SYMBOL(drm_sysfb_mode_at);
++
++struct drm_display_mode drm_sysfb_mode(unsigned int width,
++				       unsigned int height,
++				       unsigned int width_mm,
++				       unsigned int height_mm)
++{
++	return drm_sysfb_mode_at(width, height, width_mm, height_mm, 60);
++}
+ EXPORT_SYMBOL(drm_sysfb_mode);
+ 
+ /*
+@@ -595,6 +605,7 @@ int drm_sysfb_connector_helper_get_modes(struct drm_connector *connector)
+ {
+ 	struct drm_sysfb_device *sysfb = to_drm_sysfb_device(connector->dev);
+ 	const struct drm_edid *drm_edid;
++	unsigned int count, i;
+ 
+ 	if (sysfb->edid) {
+ 		drm_edid = drm_edid_read_custom(connector, drm_sysfb_get_edid_block, sysfb);
+@@ -603,6 +614,18 @@ int drm_sysfb_connector_helper_get_modes(struct drm_connector *connector)
+ 	}
+ 
+ 	/* Return the fixed mode even with EDID */
+-	return drm_connector_helper_get_modes_fixed(connector, &sysfb->fb_mode);
++	count = drm_connector_helper_get_modes_fixed(connector, &sysfb->fb_mode);
++
++	for (i = 0; i < sysfb->n_extra_modes; i++) {
++		struct drm_display_mode *mode = drm_mode_duplicate(connector->dev,
++								   &sysfb->extra_modes[i]);
++
++		if (!mode)
++			continue;
++		drm_mode_probed_add(connector, mode);
++		count++;
++	}
++
++	return count;
+ }
+ EXPORT_SYMBOL(drm_sysfb_connector_helper_get_modes);
+diff --git a/drivers/gpu/drm/sysfb/simpledrm.c b/drivers/gpu/drm/sysfb/simpledrm.c
+index 253aab447..619d486a0 100644
+--- a/drivers/gpu/drm/sysfb/simpledrm.c
++++ b/drivers/gpu/drm/sysfb/simpledrm.c
+@@ -745,6 +745,7 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
+ 	struct drm_device *dev;
+ 	int width, height, stride;
+ 	int width_mm = 0, height_mm = 0;
++	unsigned int refresh = 60;	/* Hz; the sysfb default */
+ 	struct device_node *panel_node;
+ 	const struct drm_format_info *format;
+ 	struct resource *res, *mem = NULL;
+@@ -822,7 +823,44 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
+ 			return ERR_PTR(-EINVAL);
+ 	}
+ 
+-	sysfb->fb_mode = drm_sysfb_mode(width, height, width_mm, height_mm);
++	/*
++	 * A framebuffer left by the bootloader behind a command-mode panel runs
++	 * at whatever the panel scans at; firmware has no way to describe that.
++	 * Let the DT state the rate so the mode carries it (a mode with an
++	 * unknown rate makes compositors fall back to 60 Hz pacing).
++	 */
++	if (!of_property_read_u32(of_node, "refresh-rate", &refresh))
++		drm_info(dev, "simplefb: %u Hz refresh rate\n", refresh);
++
++	sysfb->fb_mode = drm_sysfb_mode_at(width, height, width_mm, height_mm, refresh);
++
++	/*
++	 * A command-mode panel can change its rate, so list the other rates it
++	 * supports. The compositor then offers them and the panel driver picks
++	 * the one that was set.
++	 */
++	if (of_node) {
++		u32 rates[8];
++		int nrates, i;
++
++		nrates = of_property_read_variable_u32_array(of_node, "refresh-rates",
++							     rates, 1, ARRAY_SIZE(rates));
++		if (nrates > 0) {
++			sysfb->extra_modes = devm_kcalloc(dev->dev, nrates,
++							  sizeof(*sysfb->extra_modes),
++							  GFP_KERNEL);
++			if (!sysfb->extra_modes)
++				return ERR_PTR(-ENOMEM);
++			for (i = 0; i < nrates; i++) {
++				if (rates[i] == refresh)
++					continue;
++				sysfb->extra_modes[sysfb->n_extra_modes++] =
++					drm_sysfb_mode_at(width, height, width_mm, height_mm,
++							  rates[i]);
++			}
++		}
++	}
++
+ 	sysfb->fb_format = format;
+ 	sysfb->fb_pitch = stride;
+ 
+-- 
+2.43.0
+

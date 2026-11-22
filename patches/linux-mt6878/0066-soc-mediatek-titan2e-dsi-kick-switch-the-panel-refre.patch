@@ -1,0 +1,199 @@
+From aad6e69b79504a03dc8fe07af7af5d298355d0bf Mon Sep 17 00:00:00 2001
+From: Andres <48775054+sunnysideness@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 08:33:31 -0800
+Subject: [PATCH 66/67] soc: mediatek: titan2e-dsi-kick: switch the panel
+ refresh rate with the mode
+
+The VTDR6130A changes its internal frame rate with DCS 0x6C: 0x00 for 120 Hz,
+0x01 for 90 Hz and 0x02 for 60 Hz, followed by 0x6D = 0x00. That is the
+sequence in the vendor driver (panel-VTDR6130A.ko, mode_switch_to_{60,90,120}
+in the phone's vendor_boot ramdisk).
+
+Expose a "refresh" module parameter for testing, and when simpledrm enables the
+output, read the rate from the mode that was just set and apply it. Frames
+start on TE, so the TE rate follows the panel and one frame per TE keeps the
+compositor in step with whatever rate the panel runs at.
+
+A mode change disables and re-enables the CRTC in quick succession. Sleeping
+the panel for the disable half raced the rate change and once left the display
+grey after a switch, so defer the panel sleep by 300 ms and cancel it when the
+output comes back; a modeset is a reconfigure, not a screen-off.
+
+Signed-off-by: Andres <48775054+sunnysideness@users.noreply.github.com>
+---
+ drivers/soc/mediatek/titan2e-dsi-kick.c | 116 +++++++++++++++++++++++-
+ 1 file changed, 114 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/soc/mediatek/titan2e-dsi-kick.c b/drivers/soc/mediatek/titan2e-dsi-kick.c
+index 2004c263e..1977eba56 100644
+--- a/drivers/soc/mediatek/titan2e-dsi-kick.c
++++ b/drivers/soc/mediatek/titan2e-dsi-kick.c
+@@ -43,6 +43,7 @@
+ #include <linux/platform_data/simplefb.h>
+ #include <linux/platform_device.h>
+ #include <linux/spinlock.h>
++#include <drm/drm_crtc.h>
+ #include <drm/drm_vblank.h>
+ #include <video/mipi_display.h>
+ 
+@@ -104,6 +105,9 @@ struct titan2e_kick {
+ 	unsigned long last_te;
+ 	bool panel_on;
+ 	struct drm_crtc *vblank_crtc;	/* set while simpledrm wants vblank interrupts */
++	struct work_struct rate_work;	/* panel rate from the mode that was set */
++	struct delayed_work off_work;	/* deferred panel sleep, cancelled by a modeset */
++	unsigned int target_rate;
+ };
+ 
+ static int titan2e_wait_idle(struct titan2e_kick *k)
+@@ -316,6 +320,87 @@ static int titan2e_dcs_write(struct titan2e_kick *k, const u8 *data, size_t len)
+ 	return titan2e_dsi_write(k, data, len, false, true);
+ }
+ 
++/*
++ * Panel frame rate. The VTDR6130A changes its internal rate with DCS 0x6C
++ * (0x00 = 120 Hz, 0x01 = 90 Hz, 0x02 = 60 Hz) followed by 0x6D = 0x00; the
++ * values are those of the vendor's panel-VTDR6130A driver, recovered from
++ * mode_switch_to_{60,90,120} on the phone's vendor_boot ramdisk. The TE rate
++ * follows the panel, and frames start on TE, so one frame per TE keeps the
++ * compositor in step with whichever rate the panel is running at.
++ */
++static struct titan2e_kick *titan2e_kick_dev;
++static unsigned int refresh = 120;
++
++static int titan2e_set_rate(struct titan2e_kick *k, unsigned int rate)
++{
++	u8 rate_cmd[2] = { 0x6c, 0xff };
++	u8 mux_cmd[2] = { 0x6d, 0x00 };
++	int ret;
++
++	switch (rate) {
++	case 120: rate_cmd[1] = 0x00; break;
++	case 90:  rate_cmd[1] = 0x01; break;
++	case 60:  rate_cmd[1] = 0x02; break;
++	default:
++		return -EINVAL;
++	}
++
++	if (!k || !k->panel_on)
++		return -ENODEV;
++
++	mutex_lock(&k->lock);
++	titan2e_hold(k);
++	ret = titan2e_dcs_write(k, rate_cmd, sizeof(rate_cmd));
++	if (!ret)
++		ret = titan2e_dcs_write(k, mux_cmd, sizeof(mux_cmd));
++	titan2e_release(k);
++	mutex_unlock(&k->lock);
++
++	if (!ret) {
++		refresh = rate;
++		dev_info(k->dev, "panel refresh %u Hz\n", rate);
++	}
++	return ret;
++}
++
++static void titan2e_panel_power(struct titan2e_kick *k, bool on);
++
++static void titan2e_rate_work(struct work_struct *work)
++{
++	struct titan2e_kick *k = container_of(work, struct titan2e_kick, rate_work);
++
++	titan2e_set_rate(k, k->target_rate);
++}
++
++static void titan2e_off_work(struct work_struct *work)
++{
++	struct titan2e_kick *k = container_of(to_delayed_work(work),
++					      struct titan2e_kick, off_work);
++
++	titan2e_panel_power(k, false);
++}
++
++static int titan2e_refresh_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int rate;
++	int ret = kstrtouint(val, 10, &rate);
++
++	if (ret)
++		return ret;
++	if (!titan2e_kick_dev)
++		return -ENODEV;
++
++	titan2e_kick_dev->target_rate = rate;
++	return titan2e_set_rate(titan2e_kick_dev, rate);
++}
++
++static const struct kernel_param_ops titan2e_refresh_ops = {
++	.set = titan2e_refresh_set,
++	.get = param_get_uint,
++};
++
++module_param_cb(refresh, &titan2e_refresh_ops, &refresh, 0644);
++
+ struct titan2e_cmd {
+ 	u8 type;
+ 	u8 len;
+@@ -457,9 +542,29 @@ static int titan2e_crtc_event(struct notifier_block *nb, unsigned long event, vo
+ 
+ 	switch (event) {
+ 	case SIMPLEDRM_OUTPUT_OFF:
+-	case SIMPLEDRM_OUTPUT_ON:
+-		titan2e_panel_power(k, event == SIMPLEDRM_OUTPUT_ON);
++		/*
++		 * A mode change disables and re-enables the CRTC in quick
++		 * succession. Sleeping the panel for that would race the rate
++		 * switch and can leave the display grey, so defer the sleep and
++		 * let a following OUTPUT_ON cancel it.
++		 */
++		schedule_delayed_work(&k->off_work, msecs_to_jiffies(300));
++		break;
++	case SIMPLEDRM_OUTPUT_ON: {
++		struct drm_crtc *crtc = data;
++		unsigned int rate;
++
++		cancel_delayed_work_sync(&k->off_work);
++		if (!k->panel_on)
++			titan2e_panel_power(k, true);
++		/* The mode that was just set says which rate the panel should run. */
++		rate = crtc && crtc->state ? drm_mode_vrefresh(&crtc->state->mode) : 0;
++		if (rate) {
++			k->target_rate = rate;
++			schedule_work(&k->rate_work);
++		}
+ 		break;
++	}
+ 	case SIMPLEDRM_FRAME_BEGIN:
+ 		/* Don't overwrite the framebuffer while the panel is reading it. */
+ 		titan2e_hold(k);
+@@ -568,6 +673,10 @@ static int titan2e_kick_probe(struct platform_device *pdev)
+ 	if (IS_ERR(k->bl))
+ 		return dev_err_probe(&pdev->dev, PTR_ERR(k->bl), "cannot register backlight\n");
+ 
++	INIT_WORK(&k->rate_work, titan2e_rate_work);
++	INIT_DELAYED_WORK(&k->off_work, titan2e_off_work);
++	k->target_rate = refresh;
++
+ 	k->crtc_nb.notifier_call = titan2e_crtc_event;
+ 	ret = simpledrm_register_crtc_notifier(&k->crtc_nb);
+ 	if (ret)
+@@ -586,6 +695,7 @@ static int titan2e_kick_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 	platform_set_drvdata(pdev, k);
++	titan2e_kick_dev = k;
+ 	dev_info(&pdev->dev, "command-mode panel: TE-synced refresh\n");
+ 	return 0;
+ }
+@@ -596,6 +706,8 @@ static void titan2e_kick_remove(struct platform_device *pdev)
+ 
+ 	simpledrm_unregister_vblank_source(&k->vblank_nb);
+ 	simpledrm_unregister_crtc_notifier(&k->crtc_nb);
++	cancel_delayed_work_sync(&k->off_work);
++	cancel_work_sync(&k->rate_work);
+ 	kthread_stop(k->thread);
+ 	writel(0, k->dsi + DSI_INTEN);
+ 	hrtimer_cancel(&k->delay_timer);
+-- 
+2.43.0
+

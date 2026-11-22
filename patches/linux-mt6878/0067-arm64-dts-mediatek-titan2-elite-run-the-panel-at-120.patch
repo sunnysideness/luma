@@ -1,0 +1,47 @@
+From c97637e1d48000bc1de68f5e787f5ebf486409cb Mon Sep 17 00:00:00 2001
+From: Andres <48775054+sunnysideness@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 08:33:31 -0800
+Subject: [PATCH 67/67] arm64: dts: mediatek: titan2-elite: run the panel at
+ 120 Hz and offer 60/90/120
+
+The VTDR6130A scans at ~121 Hz. titan2e_dsi_kick is built in, so its pacing
+knob belongs on the command line: one frame per TE gives 120 fps instead of the
+previous every-second-TE 60 fps.
+
+State the rate on the framebuffer node so simpledrm's mode carries it, and list
+the rates the panel can switch between so the compositor offers them.
+
+Signed-off-by: Andres <48775054+sunnysideness@users.noreply.github.com>
+---
+ .../boot/dts/mediatek/mt6878-unihertz-titan2-elite.dts    | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-elite.dts b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-elite.dts
+index cec7ff415..8d4f9ab06 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-elite.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-elite.dts
+@@ -152,7 +152,9 @@ key-volume-up {
+ 		};
+ 	};
+ 	chosen {
+-		bootargs = "clk_ignore_unused pd_ignore_unused rdinit=/init loglevel=8 panic=5 softlockup_panic=1";
++		/* titan2e_dsi_kick is built in: one frame per TE keeps the
++		 * compositor at the panel's 120 Hz instead of every second TE. */
++		bootargs = "clk_ignore_unused pd_ignore_unused rdinit=/init loglevel=8 panic=5 softlockup_panic=1 titan2e_dsi_kick.te_skip=1";
+ 		#address-cells = <2>;
+ 		#size-cells = <2>;
+ 		ranges;
+@@ -166,6 +168,10 @@ simplefb@ff0cf000 {
+ 			reg = <0x0 0xff0cf000 0x0 0xf30000>;
+ 			width = <1080>;
+ 			height = <1200>;
++			/* the panel scans at ~120 Hz (TE); carry it in the mode */
++			refresh-rate = <120>;
++			/* rates the VTDR6130A can switch between (DCS 0x6C) */
++			refresh-rates = <60 90 120>;
+ 			stride = <(1088 * 4)>;
+ 			format = "a8r8g8b8";
+ 			panel = <&fb_panel>;
+-- 
+2.43.0
+

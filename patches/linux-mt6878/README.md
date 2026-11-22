@@ -26,6 +26,7 @@ is then `7.2.0-luma-titan2e-m2-g7083190aafdc` on every build.
 | 0054-0056 | NFC VEN kept asserted for SIM access and reserved from CONNSYS; GPIO hogs for MT6878 pinctrl. |
 | 0057-0063 | MT6375 charger, MT6369 VIBR vibration motor, AW36404 keyboard backlight. |
 | 0064 | Panel reset and re-init when the tearing signal does not return after wake. |
+| 0065-0067 | Panel refresh: simpledrm's mode carries the panel's 120 Hz, the VTDR6130A switches between 60/90/120 with DCS 0x6C as the compositor sets a mode, and the device tree exposes those rates and paces one frame per TE. |
 
 0019 and 0020 port MediaTek's GPL-2.0 MT6878 AFE and MT6369 codec drivers from
 [motorola-mt6878/kernel_device_modules](https://github.com/motorola-mt6878/kernel_device_modules)

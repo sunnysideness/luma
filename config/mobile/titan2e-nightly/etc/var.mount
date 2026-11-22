@@ -1,0 +1,15 @@
+# Static copy of ostree's generated /var mount, so a failed
+# ostree-system-generator at boot cannot leave /var unmounted and silently
+# displace everything written to /var into the deployment's shadow directory.
+# (Known issue on this image: the generator exits 1 on every boot.)
+[Unit]
+Description=OSTree /var (static fallback)
+Documentation=man:ostree(1)
+DefaultDependencies=no
+After=local-fs-pre.target sysroot.mount
+Before=local-fs.target
+
+[Mount]
+Where=/var
+What=/sysroot/ostree/deploy/luma/var
+Options=bind,slave,shared

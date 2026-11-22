@@ -1,0 +1,91 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: Apache-2.0
+# Unihertz Titan 2 Elite initramfs, built into the kernel: mount the Luma root
+# from partition 1 of the microSD card, pick the OSTree deployment from
+# ostree's boot entries, let that deployment's own ostree-prepare-root set up
+# the root, and start systemd in it.
+#
+# Based on config/mobile/titan2e-initramfs/init from SimplyLuma/luma
+# devices/titan2elite (alpha), with these changes:
+#  * create the mount points itself and log every step to /dev/kmsg (the screen
+#    and journal), so a failing boot can be seen live and read offline;
+#  * ostree 2026.4 treats a pre-existing /run/ostree as fatal, so it is not
+#    pre-created (systemd's var.mount handles /var);
+#  * a diagnostic block is appended to /sysroot/boot/luma-diag.txt before a
+#    restart.
+# It never writes the boot-control block in misc.
+/bin/busybox --install -s /bin
+mkdir -p /proc /sys /dev /run /sysroot /tmp
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+# Everything from here on goes to the kernel log: visible on the panel and
+# recoverable from the card/journal.
+exec >/dev/kmsg 2>&1
+log() { echo "luma-initramfs: $*"; }
+diag() {
+	[ -d /sysroot/boot ] || return 0
+	{
+		echo "--- diag $(date 2>/dev/null) ---"
+		echo "reason: $*"
+		echo "cmdline: $(cat /proc/cmdline)"
+		dmesg | grep -iE "LUMA|mmc|msdc|ostree|EXT4" | tail -n 40
+	} >>/sysroot/boot/luma-diag.txt 2>/dev/null
+	sync
+}
+fail() { log "FAILED: $*"; diag "$*"; log "restarting in 30 s"; sleep 30; reboot -f; }
+
+log "initramfs start"
+i=0
+while [ ! -b /dev/mmcblk0p1 ] && [ $i -lt 60 ]; do sleep 1; i=$((i + 1)); done
+[ -b /dev/mmcblk0p1 ] || fail "no microSD root (mmcblk0p1) after 60 s"
+log "card present after ${i}s"
+mount /dev/mmcblk0p1 /sysroot || fail "cannot mount the microSD root"
+log "card mounted at /sysroot"
+
+B=/sysroot/boot
+set -- $(for f in "$B"/loader/entries/*.conf; do
+	[ -e "$f" ] && echo "$(sed -n 's/^version //p' "$f") $f"
+done | sort -rn | cut -d' ' -f2)
+[ $# -gt 0 ] || fail "no boot entries in /boot/loader/entries"
+entry_target() { sed -n 's/^options .*ostree=\([^ ]*\).*/\1/p' "$1"; }
+newest=$(entry_target "$1")
+previous=
+[ $# -gt 1 ] && previous=$(entry_target "$2")
+target=$newest
+log "boot entry: $1 -> $target"
+if [ "$newest" != "$(cat "$B/luma-boot-ok" 2>/dev/null)" ]; then
+	id= tries=0
+	[ -e "$B/luma-boot-attempt" ] && read -r id tries <"$B/luma-boot-attempt"
+	[ "$id" = "$newest" ] || tries=0
+	if [ "${tries:-0}" -ge 2 ] && [ -n "$previous" ]; then
+		log "$newest did not finish booting twice; booting $previous"
+		target=$previous
+	else
+		echo "$newest $(($(echo "${tries:-0}") + 1))" >"$B/luma-boot-attempt.new" &&
+			mv "$B/luma-boot-attempt.new" "$B/luma-boot-attempt" && sync
+	fi
+fi
+[ -n "$target" ] || fail "boot entry without ostree="
+D=$(cd "/sysroot$target" 2>/dev/null && pwd -P) || fail "no OSTree deployment at $target"
+log "deployment: $D"
+
+echo "$(cat /proc/cmdline) ostree=$target" >/run/luma-cmdline
+mount --bind /run/luma-cmdline /proc/cmdline || fail "cannot bind /proc/cmdline"
+{
+	echo "== run probe =="
+	ls -ld /run 2>&1
+	ls -ld /run/ostree 2>&1 || echo "no /run/ostree (good)"
+	echo "== deployment =="
+	ls -ld "$D" "$D/run" 2>&1
+} >"$B/prepare-root.log" 2>&1
+log "prepare-root start"
+"$D/usr/lib/ld-linux-aarch64.so.1" --library-path "$D/usr/lib64:$D/usr/lib" \
+	"$D/usr/lib/ostree/ostree-prepare-root" /sysroot >>"$B/prepare-root.log" 2>&1
+rc=$?
+echo "prepare-root rc=$rc" >>"$B/prepare-root.log"
+[ "$rc" = 0 ] || fail "ostree-prepare-root failed for $target (rc=$rc)"
+log "prepare-root ok; switching root"
+for m in /run /dev /sys /proc; do mount --move "$m" "/sysroot$m" || fail "cannot move $m"; done
+exec switch_root /sysroot /usr/lib/systemd/systemd
